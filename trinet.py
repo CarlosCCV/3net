@@ -23,32 +23,113 @@
 
 from layers import *
 from utils import *
+from collections import namedtuple
+
+trinet_parameters = namedtuple('parameters',
+                               'encoder, '
+                               'height, width, '
+                               'batch_size, '
+                               'num_threads, '
+                               'num_epochs, '
+                               'alpha_image_loss, '
+                               'disp_gradient_loss_weight, '
+                               'lr_loss_weight, '
+                               'full_summary')
 
 class trinet(object):
 
-    def __init__(self, placeholders=None, net='vgg'):
-        self.model_collection = ['3net']    
-        self.placeholders = placeholders
+    def __init__(self,params, mode, left, central, right, reuse_variables=None, model_index=0, net='vgg'):
+        self.params = params
+        self.mode = mode
+        self.model_collection = ['model_0']
+        self.left = left
+        self.right = right
+        self.central = central
+        self.reuse_variables = reuse_variables
+        self.model_index = model_index
+
         self.build_model(net)
-        self.build_output()
-    
+        self.build_outputs()
+        if self.mode == 'test':
+            return
+
+        self.build_losses()
+        self.build_summaries()
+
+    def gradient_x(self, img):
+        gx = img[:,:,:-1,:] - img[:,:,1:,:]
+        return gx
+
+    def gradient_y(self, img):
+        gy = img[:,:-1,:,:] - img[:,1:,:,:]
+        return gy
+
+    def scale_pyramid(self, img, num_scales):
+        scaled_imgs = [img]
+        s = tf.shape(img)
+        h = s[1]
+        w = s[2]
+        for i in range(num_scales - 1):
+            ratio = 2 ** (i + 1)
+            nh = h // ratio
+            nw = w // ratio
+            scaled_imgs.append(tf.image.resize_area(img, [nh, nw]))
+        return scaled_imgs
+
+    def generate_image_left(self, img, disp):
+        return bilinear_sampler_1d_h(img, -disp)
+
+    def generate_image_right(self, img, disp):
+        return bilinear_sampler_1d_h(img, disp)
+
+    def SSIM(self, x, y):
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+
+        mu_x = slim.avg_pool2d(x, 3, 1, 'VALID')
+        mu_y = slim.avg_pool2d(y, 3, 1, 'VALID')
+
+        sigma_x  = slim.avg_pool2d(x ** 2, 3, 1, 'VALID') - mu_x ** 2
+        sigma_y  = slim.avg_pool2d(y ** 2, 3, 1, 'VALID') - mu_y ** 2
+        sigma_xy = slim.avg_pool2d(x * y , 3, 1, 'VALID') - mu_x * mu_y
+
+        SSIM_n = (2 * mu_x * mu_y + C1) * (2 * sigma_xy + C2)
+        SSIM_d = (mu_x ** 2 + mu_y ** 2 + C1) * (sigma_x + sigma_y + C2)
+
+        SSIM = SSIM_n / SSIM_d
+
+        return tf.clip_by_value((1 - SSIM) / 2, 0, 1)
+
+
+    def get_disparity_smoothness(self, disp, pyramid):
+        disp_gradients_x = [self.gradient_x(d) for d in disp]
+        disp_gradients_y = [self.gradient_y(d) for d in disp]
+
+        image_gradients_x = [self.gradient_x(img) for img in pyramid]
+        image_gradients_y = [self.gradient_y(img) for img in pyramid]
+
+        weights_x = [tf.exp(-tf.reduce_mean(tf.abs(g), 3, keep_dims=True)) for g in image_gradients_x]
+        weights_y = [tf.exp(-tf.reduce_mean(tf.abs(g), 3, keep_dims=True)) for g in image_gradients_y]
+
+        smoothness_x = [disp_gradients_x[i] * weights_x[i] for i in range(4)]
+        smoothness_y = [disp_gradients_y[i] * weights_y[i] for i in range(4)]
+        return smoothness_x + smoothness_y
+
     # Build model
     def build_model(self,net): 
-        with tf.variable_scope('model') as scope:    
-          with tf.variable_scope('shared-encoder') as encoder_scope:
-            features_cr = self.build_encoder(self.placeholders['im0'],model_name=net)
+        with tf.variable_scope('model', reuse=self.reuse_variables) as scope:
+          self.left_pyramid = self.scale_pyramid(self.left, 4)
+          # if self.mode == 'train':
+          self.right_pyramid = self.scale_pyramid(self.right, 4)
+          self.central_pyramid = self.scale_pyramid(self.central, 4)
+
+          with tf.variable_scope('shared-encoder'):
+            features_cr = self.build_encoder(self.central,model_name=net)
             features_cl = features_cr
           with tf.variable_scope('encoder-C2R'):
-            self.disp_cr = self.build_decoder(features_cr,model_name=net)
+            self.disp_c2r = self.build_decoder(features_cr,model_name=net)
           with tf.variable_scope('encoder-C2L'):
-            self.disp_cl = self.build_decoder(features_cl,model_name=net)
-              
-    def build_output(self):
-        self.disparity_cr = self.disp_cr[0][0,:,:,0]
-        self.disparity_cl = self.disp_cl[0][0,:,:,0]
-        self.warp_left = generate_image_left(self.placeholders['im0'], self.disparity_cl)[0]
-        self.warp_right = generate_image_right(self.placeholders['im0'], self.disparity_cr)[0]
-      
+            self.disp_c2l = self.build_decoder(features_cl,model_name=net)
       
     # Build shared encoder
     def build_encoder(self, model_input, model_name='vgg'):
@@ -145,3 +226,161 @@ class trinet(object):
             disp1 = get_disp(iconv1)
 
           return disp1, disp2, disp3, disp4    
+    def build_outputs(self):
+        #self.disparity_cr = self.disp_cr[0][0,:,:,0]
+        #self.disparity_cl = self.disp_cl[0][0,:,:,0]
+        #self.warp_left = generate_image_left(self.placeholders['im0'], self.disparity_cl)[0]
+        #self.warp_right = generate_image_right(self.placeholders['im0'], self.disparity_cr)[0]
+
+        # STORE DISPARITIES
+        with tf.variable_scope('disparities'):
+
+            self.disp_lc = [tf.expand_dims(d[:, :, :, 0], 3) for d in self.disp_c2l]
+            self.disp_cl = [tf.expand_dims(d[:, :, :, 1], 3) for d in self.disp_c2l]
+
+            self.disp_cr = [tf.expand_dims(d[:, :, :, 0], 3) for d in self.disp_c2r]
+            self.disp_rc = [tf.expand_dims(d[:, :, :, 1], 3) for d in self.disp_c2r]
+
+        # GENERATE IMAGES
+        with tf.variable_scope('images'):
+            self.left_est = [self.generate_image_left(self.central_pyramid[i], self.disp_lc[i]) for i in range(4)]
+            self.cl_est = [self.generate_image_right(self.left_pyramid[i], self.disp_cl[i]) for i in range(4)]
+
+            self.cr_est = [self.generate_image_left(self.right_pyramid[i], self.disp_cr[i]) for i in range(4)]
+            self.right_est = [self.generate_image_right(self.central_pyramid[i], self.disp_rc[i]) for i in range(4)]
+
+        # LR CONSISTENCY
+        with tf.variable_scope('left-right'):
+            self.cl_to_lc_disp = [self.generate_image_left(self.disp_cl[i], self.disp_lc[i]) for i in range(4)]
+            self.lc_to_cl_disp = [self.generate_image_right(self.disp_lc[i], self.disp_cl[i]) for i in range(4)]
+
+            self.rc_to_cr_disp = [self.generate_image_left(self.disp_rc[i], self.disp_cr[i]) for i in range(4)]
+            self.cr_to_rc_disp = [self.generate_image_right(self.disp_cr[i], self.disp_rc[i]) for i in range(4)]
+
+        # DISPARITY SMOOTHNESS
+        with tf.variable_scope('smoothness'):
+            self.disp_lc_smoothness  = self.get_disparity_smoothness(self.disp_lc,  self.left_pyramid)
+            self.disp_cl_smoothness = self.get_disparity_smoothness(self.disp_cl, self.central_pyramid)
+
+            self.disp_cr_smoothness = self.get_disparity_smoothness(self.disp_cr, self.central_pyramid)
+            self.disp_rc_smoothness = self.get_disparity_smoothness(self.disp_rc, self.right_pyramid)
+
+    def build_losses(self):
+        with tf.variable_scope('losses', reuse=self.reuse_variables):
+            # IMAGE RECONSTRUCTION
+            # L1
+            self.l1_left = [tf.abs(self.left_est[i] - self.left_pyramid[i]) for i in range(4)]
+            self.l1_reconstruction_loss_left = [tf.reduce_mean(l) for l in self.l1_left]
+
+            self.l1_right = [tf.abs(self.right_est[i] - self.right_pyramid[i]) for i in range(4)]
+            self.l1_reconstruction_loss_right = [tf.reduce_mean(l) for l in self.l1_right]
+
+            self.l1_cl = [tf.abs(self.cl_est[i] - self.central_pyramid[i]) for i in range(4)]
+            self.l1_reconstruction_loss_cl = [tf.reduce_mean(l) for l in self.l1_cl]
+
+            self.l1_cr = [tf.abs(self.cr_est[i] - self.central_pyramid[i]) for i in range(4)]
+            self.l1_reconstruction_loss_cr = [tf.reduce_mean(l) for l in self.l1_cr]
+
+            # SSIM
+            self.ssim_left = [self.SSIM(self.left_est[i], self.left_pyramid[i]) for i in range(4)]
+            self.ssim_loss_left = [tf.reduce_mean(s) for s in self.ssim_left]
+
+            self.ssim_right = [self.SSIM(self.right_est[i], self.right_pyramid[i]) for i in range(4)]
+            self.ssim_loss_right = [tf.reduce_mean(s) for s in self.ssim_right]
+
+            self.ssim_cl = [self.SSIM(self.cl_est[i], self.central_pyramid[i]) for i in range(4)]
+            self.ssim_loss_cl = [tf.reduce_mean(s) for s in self.ssim_cl]
+
+            self.ssim_cr = [self.SSIM(self.cr_est[i], self.central_pyramid[i]) for i in range(4)]
+            self.ssim_loss_cr = [tf.reduce_mean(s) for s in self.ssim_cr]
+
+            # WEIGTHED SUM
+            self.image_loss_right = [self.params.alpha_image_loss * self.ssim_loss_right[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_right[i] for i in range(4)]
+            self.image_loss_left = [self.params.alpha_image_loss * self.ssim_loss_left[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_left[i] for i in range(4)]
+            self.image_loss_cl = [self.params.alpha_image_loss * self.ssim_loss_cl[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_cl[i] for i in range(4)]
+            self.image_loss_cr = [self.params.alpha_image_loss * self.ssim_loss_cr[i] + (1 - self.params.alpha_image_loss) * self.l1_reconstruction_loss_cr[i] for i in range(4)]
+
+            self.image_loss = tf.add_n(self.image_loss_left +  self.image_loss_cl + self.image_loss_right + self.image_loss_cr)
+
+            self.image_loss_L = tf.add_n(self.image_loss_left +  self.image_loss_cl)
+            self.image_loss_R = tf.add_n(self.image_loss_right + self.image_loss_cr)
+
+
+            # DISPARITY SMOOTHNESS
+            self.disp_lc_loss = [tf.reduce_mean(tf.abs(self.disp_lc_smoothness[i])) / 2 ** i for i in range(4)]
+            self.disp_cl_loss = [tf.reduce_mean(tf.abs(self.disp_cl_smoothness[i])) / 2 ** i for i in range(4)]
+
+            self.disp_rc_loss = [tf.reduce_mean(tf.abs(self.disp_rc_smoothness[i])) / 2 ** i for i in range(4)]
+            self.disp_cr_loss = [tf.reduce_mean(tf.abs(self.disp_cr_smoothness[i])) / 2 ** i for i in range(4)]
+
+            self.disp_gradient_loss = tf.add_n(self.disp_lc_loss + self.disp_cl_loss + self.disp_rc_loss + self.disp_cr_loss)
+
+            self.disp_gradient_loss_L = tf.add_n(self.disp_lc_loss + self.disp_cl_loss)
+            self.disp_gradient_loss_R = tf.add_n(self.disp_rc_loss + self.disp_cr_loss)
+
+
+            # LR CONSISTENCY
+            self.lr_lc_loss = [tf.reduce_mean(tf.abs(self.cl_to_lc_disp[i] - self.disp_lc[i])) for i in range(4)]
+            self.lr_cl_loss = [tf.reduce_mean(tf.abs(self.lc_to_cl_disp[i] - self.disp_cl[i])) for i in range(4)]
+
+            self.lr_rc_loss = [tf.reduce_mean(tf.abs(self.cr_to_rc_disp[i] - self.disp_rc[i])) for i in range(4)]
+            self.lr_cr_loss = [tf.reduce_mean(tf.abs(self.rc_to_cr_disp[i] - self.disp_cr[i])) for i in range(4)]
+
+
+            self.lr_loss = tf.add_n(self.lr_lc_loss + self.lr_cl_loss + self.lr_rc_loss + self.lr_cr_loss)
+
+            self.lr_loss_L = tf.add_n(self.lr_lc_loss + self.lr_cl_loss)
+            self.lr_loss_R = tf.add_n(self.lr_rc_loss + self.lr_cr_loss)
+
+            # CENTRAL DISPARITY CONSISTENCY
+            self.central_disparity_dif = [tf.reduce_mean(tf.abs(self.disp_cl[i] - self.disp_cr[i])) for i in range(4)]
+            self.central_disparity_loss = tf.add_n(self.central_disparity_dif)
+
+            # TOTAL LOSS
+            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss + self.params.lr_loss_weight * self.lr_loss + self.central_disparity_loss
+
+            self.total_loss_L =  self.image_loss_L + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_L + self.params.lr_loss_weight * self.lr_loss_L
+            self.total_loss_R = self.image_loss_R + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_R + self.params.lr_loss_weight * self.lr_loss_R
+
+    def build_summaries(self):
+        # SUMMARIES
+        with tf.device('/cpu:0'):
+            for i in range(4):
+                tf.summary.scalar('ssim_loss_' + str(i), self.ssim_loss_left[i] + self.ssim_loss_cl[i] + self.ssim_loss_right[i] + self.ssim_loss_cr[i], collections=self.model_collection)
+                tf.summary.scalar('l1_loss_' + str(i), self.l1_reconstruction_loss_left[i] + self.l1_reconstruction_loss_cl[i] + self.l1_reconstruction_loss_right[i] + self.l1_reconstruction_loss_cr[i], collections=self.model_collection)
+                tf.summary.scalar('image_loss_' + str(i), self.image_loss_left[i] + self.image_loss_cl[i] + self.image_loss_right[i] + self.image_loss_cr[i], collections=self.model_collection)
+                tf.summary.scalar('disp_gradient_loss_' + str(i), self.disp_lc_loss[i] + self.disp_cl_loss[i] + self.disp_rc_loss[i] + self.disp_cr_loss[i], collections=self.model_collection)
+                tf.summary.scalar('lr_loss_' + str(i), self.lr_lc_loss[i] + self.lr_cl_loss[i] + self.lr_rc_loss[i] + self.lr_cr_loss[i], collections=self.model_collection)
+                tf.summary.scalar('total_loss_L', self.total_loss_L, collections= self.model_collection)
+                tf.summary.scalar('total_loss_R', self.total_loss_R, collections=self.model_collection)
+                tf.summary.scalar('central_disparity_loss', self.central_disparity_loss, collections=self.model_collection)
+                tf.summary.image('disp_left_est_' + str(i), self.disp_lc[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('disp_cl_est_' + str(i), self.disp_cl[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('disp_right_est_' + str(i), self.disp_rc[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('disp_cr_est_' + str(i), self.disp_cr[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('left_pyramid_' + str(i), self.left_pyramid[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('central_pyramid_' + str(i), self.central_pyramid[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('right_pyramid_' + str(i), self.right_pyramid[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cr_est_' + str(i), self.cr_est[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cl_est_' + str(i), self.cl_est[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('right_est_' + str(i), self.right_est[i], max_outputs=4, collections=self.model_collection)
+
+                if self.params.full_summary:
+                    #tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('right_est_' + str(i), self.right_est[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('cl_est_' + str(i), self.cl_est[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('cr_est_' + str(i), self.cr_est[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('ssim_left_'  + str(i), self.ssim_left[i],  max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('ssim_right_' + str(i), self.ssim_right[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('ssim_cl_' + str(i), self.ssim_cl[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('ssim_cr_' + str(i), self.ssim_cr[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('l1_left_'  + str(i), self.l1_left[i],  max_outputs=4, collections=self.model_collection)
+                    tf.summary.image('l1_right_' + str(i), self.l1_right[i], max_outputs=4, collections=self.model_collection)
+                    #tf.summary.image('l1_cl_' + str(i), self.l1_cl[i], max_outputs=4, collections=self.model_collection)
+                    tf.summary.image('l1_cr_' + str(i), self.l1_cr[i], max_outputs=4, collections=self.model_collection)
+
+            if self.params.full_summary:
+                tf.summary.image('left',  self.left,   max_outputs=4, collections=self.model_collection)
+                tf.summary.image('right', self.right,  max_outputs=4, collections=self.model_collection)
+                tf.summary.image('central', self.central, max_outputs=4, collections=self.model_collection)
