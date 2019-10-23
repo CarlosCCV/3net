@@ -24,6 +24,7 @@
 from layers import *
 from utils import *
 from collections import namedtuple
+import stereo_rectification
 
 trinet_parameters = namedtuple('parameters',
                                'encoder, '
@@ -38,15 +39,19 @@ trinet_parameters = namedtuple('parameters',
 
 class trinet(object):
 
-    def __init__(self,params, mode, left, central, right, reuse_variables=None, model_index=0, net='vgg'):
+    def __init__(self,params, mode, left, cl, cr, right, intrinsics, extrinsics, reuse_variables=None, model_index=0, net='vgg'):
         self.params = params
         self.mode = mode
         self.model_collection = ['model_0']
         self.left = left
         self.right = right
-        self.central = central
+        self.cl = cl
+        self.cr = cr
         self.reuse_variables = reuse_variables
         self.model_index = model_index
+
+        self.intrinsics = intrinsics
+        self.extrinsics = extrinsics
 
         self.build_model(net)
         self.build_outputs()
@@ -121,11 +126,13 @@ class trinet(object):
           self.left_pyramid = self.scale_pyramid(self.left, 4)
           # if self.mode == 'train':
           self.right_pyramid = self.scale_pyramid(self.right, 4)
-          self.central_pyramid = self.scale_pyramid(self.central, 4)
+          self.cl_pyramid = self.scale_pyramid(self.cl, 4)
+          self.cr_pyramid = self.scale_pyramid(self.cr, 4)
 
-          with tf.variable_scope('shared-encoder'):
-            features_cr = self.build_encoder(self.central,model_name=net)
-            features_cl = features_cr
+
+          with tf.variable_scope('encoder'):
+            features_cr = self.build_encoder(self.cr,model_name=net)
+            features_cl = self.build_encoder(self.cl, model_name=net)
           with tf.variable_scope('encoder-C2R'):
             self.disp_c2r = self.build_decoder(features_cr,model_name=net)
           with tf.variable_scope('encoder-C2L'):
@@ -134,7 +141,7 @@ class trinet(object):
     # Build shared encoder
     def build_encoder(self, model_input, model_name='vgg'):
 
-        with tf.variable_scope('encoder'):
+        with tf.variable_scope('encoder', reuse = tf.AUTO_REUSE):
           if model_name == 'vgg':
             conv1 = conv_block(model_input,  32, 7) # H/2
             conv2 = conv_block(conv1,             64, 5) # H/4
@@ -243,11 +250,22 @@ class trinet(object):
 
         # GENERATE IMAGES
         with tf.variable_scope('images'):
-            self.left_est = [self.generate_image_left(self.central_pyramid[i], self.disp_lc[i]) for i in range(4)]
+            self.left_est = [self.generate_image_left(self.cl_pyramid[i], self.disp_lc[i]) for i in range(4)]
             self.cl_est = [self.generate_image_right(self.left_pyramid[i], self.disp_cl[i]) for i in range(4)]
 
             self.cr_est = [self.generate_image_left(self.right_pyramid[i], self.disp_cr[i]) for i in range(4)]
-            self.right_est = [self.generate_image_right(self.central_pyramid[i], self.disp_rc[i]) for i in range(4)]
+            self.right_est = [self.generate_image_right(self.cr_pyramid[i], self.disp_rc[i]) for i in range(4)]
+
+        # UNRECTIFY CENTRAL IMAGES
+            print('LEEFT EST')
+            print(type(self.left_est))
+            self.cl_est_unrect = [None] * 4
+            self.cr_est_unrect = [None] * 4
+
+            for i in range(4):
+                _,self.cl_est_unrect[i] = stereo_rectification.unrectify(self.left_est[i], self.cl_est[i], self.intrinsics[:,:,0], self.intrinsics[:,:,1], self.extrinsics[:,:,0],self.extrinsics[:,:,1], transformed_image_size=(self.params.height,self.params.width))
+                self.cr_est_unrect[i], _ = stereo_rectification.unrectify(self.cr_est[i], self.right_est[i], self.intrinsics[:, :, 1], self.intrinsics[:, :, 2], self.extrinsics[:, :, 1], self.extrinsics[:, :, 2], transformed_image_size=(self.params.height, self.params.width))
+
 
         # LR CONSISTENCY
         with tf.variable_scope('left-right'):
@@ -260,9 +278,9 @@ class trinet(object):
         # DISPARITY SMOOTHNESS
         with tf.variable_scope('smoothness'):
             self.disp_lc_smoothness  = self.get_disparity_smoothness(self.disp_lc,  self.left_pyramid)
-            self.disp_cl_smoothness = self.get_disparity_smoothness(self.disp_cl, self.central_pyramid)
+            self.disp_cl_smoothness = self.get_disparity_smoothness(self.disp_cl, self.cl_pyramid)
 
-            self.disp_cr_smoothness = self.get_disparity_smoothness(self.disp_cr, self.central_pyramid)
+            self.disp_cr_smoothness = self.get_disparity_smoothness(self.disp_cr, self.cr_pyramid)
             self.disp_rc_smoothness = self.get_disparity_smoothness(self.disp_rc, self.right_pyramid)
 
     def build_losses(self):
@@ -275,10 +293,10 @@ class trinet(object):
             self.l1_right = [tf.abs(self.right_est[i] - self.right_pyramid[i]) for i in range(4)]
             self.l1_reconstruction_loss_right = [tf.reduce_mean(l) for l in self.l1_right]
 
-            self.l1_cl = [tf.abs(self.cl_est[i] - self.central_pyramid[i]) for i in range(4)]
+            self.l1_cl = [tf.abs(self.cl_est[i] - self.cl_pyramid[i]) for i in range(4)]
             self.l1_reconstruction_loss_cl = [tf.reduce_mean(l) for l in self.l1_cl]
 
-            self.l1_cr = [tf.abs(self.cr_est[i] - self.central_pyramid[i]) for i in range(4)]
+            self.l1_cr = [tf.abs(self.cr_est[i] - self.cr_pyramid[i]) for i in range(4)]
             self.l1_reconstruction_loss_cr = [tf.reduce_mean(l) for l in self.l1_cr]
 
             # SSIM
@@ -288,10 +306,10 @@ class trinet(object):
             self.ssim_right = [self.SSIM(self.right_est[i], self.right_pyramid[i]) for i in range(4)]
             self.ssim_loss_right = [tf.reduce_mean(s) for s in self.ssim_right]
 
-            self.ssim_cl = [self.SSIM(self.cl_est[i], self.central_pyramid[i]) for i in range(4)]
+            self.ssim_cl = [self.SSIM(self.cl_est[i], self.cl_pyramid[i]) for i in range(4)]
             self.ssim_loss_cl = [tf.reduce_mean(s) for s in self.ssim_cl]
 
-            self.ssim_cr = [self.SSIM(self.cr_est[i], self.central_pyramid[i]) for i in range(4)]
+            self.ssim_cr = [self.SSIM(self.cr_est[i], self.cr_pyramid[i]) for i in range(4)]
             self.ssim_loss_cr = [tf.reduce_mean(s) for s in self.ssim_cr]
 
             # WEIGTHED SUM
@@ -332,12 +350,12 @@ class trinet(object):
             self.lr_loss_L = tf.add_n(self.lr_lc_loss + self.lr_cl_loss)
             self.lr_loss_R = tf.add_n(self.lr_rc_loss + self.lr_cr_loss)
 
-            # CENTRAL DISPARITY CONSISTENCY
-            self.central_disparity_dif = [tf.reduce_mean(tf.abs(self.disp_cl[i] - self.disp_cr[i])) for i in range(4)]
-            self.central_disparity_loss = tf.add_n(self.central_disparity_dif)
+            # CENTRAL RECONSTRUCTION CONSISTENCY
+            self.central_reconstruction_dif = [tf.reduce_mean(tf.abs(self.cl_est_unrect[i] - self.cr_est_unrect[i])) for i in range(4)]
+            self.central_reconstruction_loss = tf.add_n(self.central_reconstruction_dif)
 
             # TOTAL LOSS
-            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss + self.params.lr_loss_weight * self.lr_loss + self.central_disparity_loss
+            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss + self.params.lr_loss_weight * self.lr_loss + self.central_reconstruction_loss
 
             self.total_loss_L =  self.image_loss_L + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_L + self.params.lr_loss_weight * self.lr_loss_L
             self.total_loss_R = self.image_loss_R + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_R + self.params.lr_loss_weight * self.lr_loss_R
@@ -353,18 +371,23 @@ class trinet(object):
                 tf.summary.scalar('lr_loss_' + str(i), self.lr_lc_loss[i] + self.lr_cl_loss[i] + self.lr_rc_loss[i] + self.lr_cr_loss[i], collections=self.model_collection)
                 tf.summary.scalar('total_loss_L', self.total_loss_L, collections= self.model_collection)
                 tf.summary.scalar('total_loss_R', self.total_loss_R, collections=self.model_collection)
-                tf.summary.scalar('central_disparity_loss', self.central_disparity_loss, collections=self.model_collection)
+                tf.summary.scalar('central_reconstruction_loss', self.central_reconstruction_loss, collections=self.model_collection)
                 tf.summary.image('disp_left_est_' + str(i), self.disp_lc[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('disp_cl_est_' + str(i), self.disp_cl[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('disp_right_est_' + str(i), self.disp_rc[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('disp_cr_est_' + str(i), self.disp_cr[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('left_pyramid_' + str(i), self.left_pyramid[i], max_outputs=4, collections=self.model_collection)
-                tf.summary.image('central_pyramid_' + str(i), self.central_pyramid[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cr_pyramid_' + str(i), self.cr_pyramid[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cl_pyramid_' + str(i), self.cl_pyramid[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('right_pyramid_' + str(i), self.right_pyramid[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('cr_est_' + str(i), self.cr_est[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('cl_est_' + str(i), self.cl_est[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cr_est_unrect_' + str(i), self.cr_est_unrect[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cl_est_unrect_' + str(i), self.cl_est_unrect[i], max_outputs=4, collections=self.model_collection)
                 tf.summary.image('right_est_' + str(i), self.right_est[i], max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cl', self.cl, max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cr', self.cr, max_outputs=4, collections=self.model_collection)
 
                 if self.params.full_summary:
                     #tf.summary.image('left_est_' + str(i), self.left_est[i], max_outputs=4, collections=self.model_collection)
@@ -383,4 +406,5 @@ class trinet(object):
             if self.params.full_summary:
                 tf.summary.image('left',  self.left,   max_outputs=4, collections=self.model_collection)
                 tf.summary.image('right', self.right,  max_outputs=4, collections=self.model_collection)
-                tf.summary.image('central', self.central, max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cl', self.cl, max_outputs=4, collections=self.model_collection)
+                tf.summary.image('cr', self.cr, max_outputs=4, collections=self.model_collection)

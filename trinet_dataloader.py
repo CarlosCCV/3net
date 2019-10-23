@@ -1,4 +1,7 @@
 import tensorflow as tf
+import read_parameters
+import stereo_rectification
+import os
 
 def string_length_tf(t):
   return tf.py_func(len, [t], [tf.int64])
@@ -33,6 +36,17 @@ class TrinetDataloader(object):
         central_image_o = self.read_image(central_image_path)
         right_image_o = self.read_image(right_image_path)
 
+        # Calibration parameters of the cameras
+        self.intrinsics,self.extrinsics = read_parameters.read_calibration_parameters(self.data_path, filenames_file)
+
+        A_left = self.intrinsics[:,:,0]
+        A_center = self.intrinsics[:, :, 1]
+        A_right = self.intrinsics[:, :, 2]
+
+        extrinsics_left = self.extrinsics[:,:,0]
+        extrinsics_center = self.extrinsics[:, :, 1]
+        extrinsics_right = self.extrinsics[:, :, 2]
+
         if mode == 'train' or mode == 'test':
             # randomly flip images
             #do_flip = tf.random_uniform([], 0, 1)
@@ -46,17 +60,21 @@ class TrinetDataloader(object):
 
             # randomly augment images
             if mode == 'train':
+                left_image, cl_image, _, _ = stereo_rectification.stereo_rectify(left_image, central_image, A_left, A_center, extrinsics_left, extrinsics_center, transformed_image_size=(self.params.height, self.params.width))
+                cr_image, right_image, _, _ = stereo_rectification.stereo_rectify(central_image, right_image, A_center, A_right, extrinsics_center, extrinsics_right,transformed_image_size=(self.params.height, self.params.width))
+
                 do_augment  = tf.random_uniform([], 0, 1)
-                left_image, central_image, right_image = tf.cond(do_augment > 0.5, lambda: self.augment_images(left_image_o, central_image_o, right_image_o), lambda: (left_image_o, central_image_o, right_image_o))
+                left_image, cl_image, cr_image, right_image = tf.cond(do_augment > 0.5, lambda: self.augment_images(left_image, cl_image, cr_image, right_image), lambda: (left_image, cl_image, cr_image, right_image))
 
             left_image.set_shape( [None, None, 3])
-            central_image.set_shape([None, None, 3])
+            cr_image.set_shape([None, None, 3])
+            cl_image.set_shape([None, None, 3])
             right_image.set_shape([None, None, 3])
 
             # capacity = min_after_dequeue + (num_threads + a small safety margin) * batch_size
             min_after_dequeue = 2048
             capacity = min_after_dequeue + 4 * params.batch_size
-            self.left_image_batch, self.central_image_batch, self.right_image_batch = tf.train.shuffle_batch([left_image,central_image, right_image],
+            self.left_image_batch, self.cl_image_batch, self.cr_image_batch, self.right_image_batch = tf.train.shuffle_batch([left_image, cl_image, cr_image, right_image],
                         params.batch_size, capacity, min_after_dequeue, params.num_threads)
 
         #elif mode == 'test':
@@ -67,17 +85,19 @@ class TrinetDataloader(object):
         #        self.right_image_batch = tf.stack([right_image_o,  tf.image.flip_left_right(right_image_o)],  0)
         #        self.right_image_batch.set_shape( [2, None, None, 3])
 
-    def augment_images(self, left_image, central_image, right_image):
+    def augment_images(self, left_image, cl_image, cr_image, right_image):
         # randomly shift gamma
         random_gamma = tf.random_uniform([], 0.8, 1.2)
         left_image_aug  = left_image  ** random_gamma
-        central_image_aug = central_image ** random_gamma
+        cl_image_aug = cl_image ** random_gamma
+        cr_image_aug = cr_image ** random_gamma
         right_image_aug = right_image ** random_gamma
 
         # randomly shift brightness
         random_brightness = tf.random_uniform([], 0.5, 2.0)
         left_image_aug  =  left_image_aug * random_brightness
-        central_image_aug = central_image_aug * random_brightness
+        cl_image_aug = cl_image_aug * random_brightness
+        cr_image_aug = cr_image_aug * random_brightness
         right_image_aug = right_image_aug * random_brightness
 
         # randomly shift color
@@ -85,15 +105,17 @@ class TrinetDataloader(object):
         white = tf.ones([tf.shape(left_image)[0], tf.shape(left_image)[1]])
         color_image = tf.stack([white * random_colors[i] for i in range(3)], axis=2)
         left_image_aug  *= color_image
-        central_image_aug *= color_image
+        cl_image_aug *= color_image
+        cr_image_aug *= color_image
         right_image_aug *= color_image
 
         # saturate
         left_image_aug  = tf.clip_by_value(left_image_aug,  0, 1)
-        central_image_aug = tf.clip_by_value(central_image_aug, 0, 1)
+        cl_image_aug = tf.clip_by_value(cl_image_aug, 0, 1)
+        cr_image_aug = tf.clip_by_value(cr_image_aug, 0, 1)
         right_image_aug = tf.clip_by_value(right_image_aug, 0, 1)
 
-        return left_image_aug, central_image_aug, right_image_aug
+        return left_image_aug, cl_image_aug, cr_image_aug, right_image_aug
 
     def read_image(self, image_path):
         # tf.decode_image does not return the image size, this is an ugly workaround to handle both jpeg and png
@@ -111,6 +133,11 @@ class TrinetDataloader(object):
             crop_height = (o_height * 4) // 5
             image  =  image[:crop_height,:,:]
 
+        image  = tf.image.convert_image_dtype(image,  tf.float32)
+        image  = tf.image.resize_images(image,  [self.params.height, self.params.width], tf.image.ResizeMethod.AREA)
+
+        return image
+    def reduce_image(self, image):
         image  = tf.image.convert_image_dtype(image,  tf.float32)
         image  = tf.image.resize_images(image,  [self.params.height, self.params.width], tf.image.ResizeMethod.AREA)
 

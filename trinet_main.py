@@ -65,12 +65,14 @@ def train(params):
 
         dataloader = TrinetDataloader(args.data_path, args.filenames_file, params, args.dataset, args.mode)
         left = dataloader.left_image_batch
-        central = dataloader.central_image_batch
+        cl = dataloader.cl_image_batch
+        cr = dataloader.cr_image_batch
         right = dataloader.right_image_batch
 
-        #tgsplit for each gpu
+        #split for each gpu
         left_splits = tf.split(left, args.num_gpus, 0)
-        central_splits = tf.split(central, args.num_gpus, 0)
+        cl_splits = tf.split(cl, args.num_gpus, 0)
+        cr_splits = tf.split(cr, args.num_gpus, 0)
         right_splits = tf.split(right, args.num_gpus, 0)
 
         #tower_grads_L = []
@@ -84,7 +86,7 @@ def train(params):
             for i in range(args.num_gpus):
                 with tf.device('/gpu:%d' % i):
 
-                    model = trinet(params, args.mode, left_splits[i], central_splits[i], right_splits[i], reuse_variables, i)
+                    model = trinet(params, args.mode, left_splits[i], cl_splits[i], cr_splits[i], right_splits[i], dataloader.intrinsics, dataloader.extrinsics, reuse_variables, i)
 
                     #loss_L = model.total_loss_L
                     #loss_R = model.total_loss_R
