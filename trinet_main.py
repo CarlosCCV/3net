@@ -13,6 +13,8 @@ from trinet import *
 from trinet_dataloader import *
 from average_gradients import *
 from matplotlib import pyplot as plt
+from statistics import mean
+import cv2
 
 parser = argparse.ArgumentParser(description = "Trinet Tensorflow implementation.")
 
@@ -21,7 +23,8 @@ parser.add_argument('--model_name',                type=str,   help='model name'
 parser.add_argument('--encoder',                   type=str,   help='type of encoder, vgg or resnet50')
 parser.add_argument('--data_path',                 type=str,   help='path to the data', required=True)
 parser.add_argument('--dataset',                   type=str,   help='dataset to train on, kitti, or cityscapes', default='kitti')
-parser.add_argument('--filenames_file',            type=str,   help='path to the filenames text file', required=True)
+parser.add_argument('--filenames_file',            type=str,   help='path to the training filenames text file', required=True)
+parser.add_argument('--filenames_file_val',            type=str,   help='path to the validation filenames text file', required=False)
 parser.add_argument('--input_height',              type=int,   help='input height', default=256)
 parser.add_argument('--input_width',               type=int,   help='input width', default=512)
 parser.add_argument('--batch_size',                type=int,   help='batch size', default=8)
@@ -40,18 +43,141 @@ parser.add_argument('--full_summary',                          help='if set, wil
 
 args = parser.parse_args()
 
+
+def create_mask(image, params):
+    mask = np.zeros((params.height, params.width, 3), dtype=float)
+    for i in range(params.height):
+        for j in range(params.width):
+            mask[i, j, :] = (~(image[i, j, 0] == 101 and image[i, j, 1] == 101 and image[i, j, 2] == 101)).astype(float)
+    return mask
+
 def train(params):
     """Training loop."""
 
     with tf.Graph().as_default(), tf.device('/cpu:0'):
 
+        # Create unrectification mask
+        file = open(args.filenames_file, 'r')
+        contents = file.readlines()
+        filename = contents[0].split()
+
+        left_file = filename[0]
+        center_file = filename[1]
+        right_file = filename[2]
+
+        left_cv = cv2.imread(left_file)
+        center_cv = cv2.imread(center_file)
+        right_cv = cv2.imread(right_file)
+
+        left_cv = cv2.resize(left_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+        center_cv = cv2.resize(center_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+        right_cv = cv2.resize(right_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+
+        # Calibration parameters of the cameras (DEBERIA CREAR UNA CLASE Y LEER ESTOS PARAMETROS DESDE LA FUNCION MAIN)
+        intrinsics, extrinsics = read_parameters.read_calibration_parameters(args.data_path, args.filenames_file)
+
+        A_left = intrinsics[:, :, 0]
+        A_center = intrinsics[:, :, 1]
+        A_right = intrinsics[:, :, 2]
+
+        extrinsics_left = extrinsics[:, :, 0]
+        extrinsics_center = extrinsics[:, :, 1]
+        extrinsics_right = extrinsics[:, :, 2]
+
+        if not os.path.exists(os.path.join(args.log_directory, args.model_name)):
+            os.mkdir(os.path.join(args.log_directory, args.model_name))
+
+        # Rectification using OpenCV
+        left_rect, cl_rect = stereo_rectification.stereo_rectify(left_cv, center_cv, intrinsics[:, :, 0],
+                                                                       intrinsics[:, :, 1], extrinsics[:, :, 0],
+                                                                       extrinsics[:, :, 1], False,
+                                                                       transformed_image_size=(256, 512), directory = os.path.join(args.log_directory, args.model_name,'stereoPair0'))
+        cr_rect, right_rect = stereo_rectification.stereo_rectify(center_cv, right_cv, intrinsics[:, :, 1],
+                                                                        intrinsics[:, :, 2], extrinsics[:, :, 1],
+                                                                        extrinsics[:, :, 2], False,
+                                                                        transformed_image_size=(
+                                                                            256, 512), directory = os.path.join(args.log_directory, args.model_name,'stereoPair1'))
+
+
+        left_unrect, cl_unrect = stereo_rectification.unrectify(left_rect, cl_rect, intrinsics[:, :, 0],
+                                                                intrinsics[:, :, 1], extrinsics[:, :, 0],
+                                                                extrinsics[:, :, 1], False,
+                                                                transformed_image_size=(256, 512))
+        cr_unrect, right_unrect = stereo_rectification.unrectify(cr_rect, right_rect, intrinsics[:, :, 1],
+                                                                 intrinsics[:, :, 2], extrinsics[:, :, 1],
+                                                                 extrinsics[:, :, 2], False,
+                                                                 transformed_image_size=(256, 512))
+
+        sum_cl = np.sum(cl_unrect)
+        sum_cr = np.sum(cr_unrect)
+
+        if (sum_cl < sum_cr):
+            print('CL')
+            mask_unr = create_mask(cl_unrect, params)
+        else:
+            print('CR')
+            mask_unr = create_mask(cr_unrect, params)
+
+        plt.imshow(mask_unr.astype(float))
+        plt.show()
+
+        masks_tf = []
+        mask_unrect_tf = []
+        divisor = 1
+        for i in range(4):
+            print(i)
+
+            mask = np.zeros((np.divide(params.height, divisor).astype(int), np.divide(params.width, divisor).astype(int), 3, 4), dtype = float)
+            mask[:,:,:,0] = cv2.resize(create_mask(left_rect, params), (np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)), interpolation=cv2.INTER_AREA)
+            mask[:,:,:,1] = cv2.resize(create_mask(cl_rect, params), (np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)), interpolation=cv2.INTER_AREA)
+            mask[:,:,:,2] = cv2.resize(create_mask(cr_rect, params), (np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)), interpolation=cv2.INTER_AREA)
+            mask[:,:,:,3] = cv2.resize(create_mask(right_rect, params), (np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)), interpolation=cv2.INTER_AREA)
+
+
+
+            # plt.subplot(221)
+            # plt.imshow(mask[:,:,0,0], cmap='gray')
+            #
+            # plt.subplot(222)
+            # plt.imshow(mask[:,:,0,1], cmap='gray')
+            #
+            # plt.subplot(223)
+            # plt.imshow(mask[:,:,0,2], cmap='gray')
+            #
+            # plt.subplot(224)
+            # plt.imshow(mask[:,:,0,3], cmap='gray')
+            #
+            # plt.show()
+
+            mask_tf = tf.constant(mask[:,:,0,:])
+            mask_tf = tf.expand_dims(mask_tf, 2)
+            mask_tf = tf.cast(mask_tf, dtype = tf.float32)
+
+
+
+            masks_tf.append(mask_tf)
+
+            mask_unrect = cv2.resize(mask_unr, (np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)))
+
+            mask_unrect_ = tf.constant(mask_unrect)
+            mask_unrect_ = tf.cast(mask_unrect_, dtype=tf.float32)
+
+            mask_unrect_tf.append(mask_unrect_)
+
+            divisor = divisor*2
+
+
         global_step = tf.Variable(0, trainable=False)
 
         # OPTIMIZER
         num_training_samples = count_text_lines(args.filenames_file)
+        num_validation_samples = count_text_lines(args.filenames_file_val)
 
         steps_per_epoch = np.ceil(num_training_samples / params.batch_size).astype(np.int32)
         num_total_steps = params.num_epochs * steps_per_epoch
+
+        steps_per_epoch_val = np.ceil(num_validation_samples / params.batch_size).astype(np.int32)
+
         start_learning_rate = args.learning_rate
 
         boundaries = [np.int32((3/5) * num_total_steps), np.int32((4/5) * num_total_steps)]
@@ -60,14 +186,20 @@ def train(params):
 
         opt_step = tf.train.AdamOptimizer(learning_rate)
 
-        print("total number of samples: {}".format(num_training_samples))
-        print("total number of steps: {}".format(num_total_steps))
+        print("total number of training samples: {}".format(num_training_samples))
+        print("total number of validation samples: {}".format(num_validation_samples))
+        print("total number of training steps: {}".format(num_total_steps))
 
-        dataloader = TrinetDataloader(args.data_path, args.filenames_file, params, args.dataset, args.mode)
+        dataloader = TrinetDataloader(args.data_path, args.filenames_file, args.filenames_file_val, params, args.dataset, args.mode)
         left = dataloader.left_image_batch
         cl = dataloader.cl_image_batch
         cr = dataloader.cr_image_batch
         right = dataloader.right_image_batch
+
+        left_val = dataloader.left_image_val_batch
+        cl_val = dataloader.cl_image_val_batch
+        cr_val = dataloader.cr_image_val_batch
+        right_val = dataloader.right_image_val_batch
 
         #split for each gpu
         left_splits = tf.split(left, args.num_gpus, 0)
@@ -75,26 +207,33 @@ def train(params):
         cr_splits = tf.split(cr, args.num_gpus, 0)
         right_splits = tf.split(right, args.num_gpus, 0)
 
+        left_splits_val = tf.split(left_val, args.num_gpus, 0)
+        cl_splits_val = tf.split(cl_val, args.num_gpus, 0)
+        cr_splits_val = tf.split(cr_val, args.num_gpus, 0)
+        right_splits_val = tf.split(right_val, args.num_gpus, 0)
+
         #tower_grads_L = []
         #tower_losses_L = []
         #tower_grads_R = []
         #tower_losses_R = []
         tower_losses = []
+        tower_validation_losses = []
         tower_grads = []
         reuse_variables = None
         with tf.variable_scope(tf.get_variable_scope()):
             for i in range(args.num_gpus):
                 with tf.device('/gpu:%d' % i):
 
-                    model = trinet(params, args.mode, left_splits[i], cl_splits[i], cr_splits[i], right_splits[i], dataloader.intrinsics, dataloader.extrinsics, reuse_variables, i)
-
+                    model = trinet(params, args.mode, left_splits[i], cl_splits[i], cr_splits[i], right_splits[i], dataloader.intrinsics, dataloader.extrinsics, mask_unrect_tf, masks_tf, reuse_variables, i)
+                    #validation = trinet(params, args.mode, left_splits_val[i], cl_splits_val[i], cr_splits_val[i], right_splits_val[i], dataloader.intrinsics, dataloader.extrinsics,dataloader.mask_unrect_tf, True, i)
                     #loss_L = model.total_loss_L
                     #loss_R = model.total_loss_R
                     loss = model.total_loss
-
+                    #validation_loss = validation.total_loss
                     #tower_losses_L.append(loss_L)
                     #tower_losses_R.append(loss_R)
                     tower_losses.append(loss)
+                    #tower_validation_losses.append(validation_loss)
 
                     reuse_variables = True
 
@@ -117,11 +256,14 @@ def train(params):
         #total_loss_L = tf.reduce_mean(tower_losses_L)
         #total_loss_R = tf.reduce_mean(tower_losses_R)
         total_loss = tf.reduce_mean(tower_losses)
+        #total_validation_loss = tf.reduce_mean(tower_validation_losses)
 
         tf.summary.scalar('learning_rate', learning_rate, ['model_0'])
         #tf.summary.scalar('total_loss_L', total_loss_L, ['model_0'])
         #tf.summary.scalar('total_loss_R', total_loss_R, ['model_0'])
         tf.summary.scalar('total_loss', total_loss, ['model_0'])
+        #tf.summary.scalar('total_validation_loss', total_validation_loss, ['model_0'])
+        #tf.summary.image('mask', mask_unrect_tf, max_outputs=1, collections= ['model_0'])
         summary_op = tf.summary.merge_all('model_0')
 
 
@@ -171,20 +313,152 @@ def train(params):
                 print(print_string.format(step, examples_per_sec, loss_value, time_sofar, training_time_left))
                 summary_str = sess.run(summary_op)
                 summary_writer.add_summary(summary_str, global_step=step)
+
             if step and step % 1000 == 0:
                 train_saver.save(sess, args.log_directory + '/' + args.model_name + '/model', global_step=step)
+
+            # validation_loss_values = []
+            # if step and step/steps_per_epoch == 0:
+            #     for step_val in range(steps_per_epoch_val):
+            #         print('-------------------------------------- PERFORMING VALIDATION ------------------------------------------------')
+            #         validation_loss_value = sess.run([total_validation_loss])
+            #         validation_loss_values.append(validation_loss_value)
+            #         print_string = 'batch {:>6} | val_loss: {:.5f} | time elapsed: {:.2f}h | time left: {:.2f}h'
+            #         print(print_string.format(step_val, examples_per_sec, validation_loss_value, time_sofar, training_time_left))
+            #     mean_validation_loss = mean(validation_loss_values)
+            #
+            #     print_string = 'batch {:>6} | mean_val_loss: {:.5f} | time elapsed: {:.2f}h | time left: {:.2f}h'
+            #     print(print_string.format(step_val, examples_per_sec, validation_loss_value, time_sofar,
+            #                               training_time_left))
+            #     print('-------------------------------------------------------------------------------------------------------------')
+
 
         train_saver.save(sess, args.log_directory + '/' + args.model_name + '/model', global_step=num_total_steps)
 
 def test(params):
     """Test function."""
 
-    dataloader = TrinetDataloader(args.data_path, args.filenames_file, params, args.dataset, args.mode)
+    # Create unrectification mask
+    file = open(args.filenames_file, 'r')
+    contents = file.readlines()
+    filename = contents[0].split()
+
+    if args.output_directory == '':
+        output_directory = os.path.dirname(args.checkpoint_path)
+    else:
+        output_directory = args.output_directory
+
+    output_dir_left = os.path.join(output_directory, 'stereoPair0')
+    output_dir_right = os.path.join(output_directory, 'stereoPair1')
+
+    if not os.path.exists(output_dir_left):
+        os.mkdir(output_dir_left)
+
+    if not os.path.exists(output_dir_right):
+        os.mkdir(output_dir_right)
+
+    left_file = filename[0]
+    center_file = filename[1]
+    right_file = filename[2]
+
+    left_cv = cv2.imread(left_file)
+    center_cv = cv2.imread(center_file)
+    right_cv = cv2.imread(right_file)
+
+    left_cv = cv2.resize(left_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+    center_cv = cv2.resize(center_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+    right_cv = cv2.resize(right_cv, (params.width, params.height), interpolation=cv2.INTER_AREA)
+
+    # Calibration parameters of the cameras (DEBERIA CREAR UNA CLASE Y LEER ESTOS PARAMETROS DESDE LA FUNCION MAIN)
+    intrinsics, extrinsics = read_parameters.read_calibration_parameters(args.data_path, args.filenames_file)
+
+    A_left = intrinsics[:, :, 0]
+    A_center = intrinsics[:, :, 1]
+    A_right = intrinsics[:, :, 2]
+
+    extrinsics_left = extrinsics[:, :, 0]
+    extrinsics_center = extrinsics[:, :, 1]
+    extrinsics_right = extrinsics[:, :, 2]
+
+    # Rectification using OpenCV
+    left_rect, cl_rect = stereo_rectification.stereo_rectify(left_cv, center_cv, intrinsics[:, :, 0],
+                                                             intrinsics[:, :, 1], extrinsics[:, :, 0],
+                                                             extrinsics[:, :, 1], False,
+                                                             transformed_image_size=(256, 512),
+                                                             directory=os.path.join(output_dir_left, 'Parameters'))
+    cr_rect, right_rect = stereo_rectification.stereo_rectify(center_cv, right_cv, intrinsics[:, :, 1],
+                                                              intrinsics[:, :, 2], extrinsics[:, :, 1],
+                                                              extrinsics[:, :, 2], False,
+                                                              transformed_image_size=(256, 512),
+                                                              directory=os.path.join(output_dir_right, 'Parameters'))
+
+    left_unrect, cl_unrect = stereo_rectification.unrectify(left_rect, cl_rect, intrinsics[:, :, 0],
+                                                            intrinsics[:, :, 1], extrinsics[:, :, 0],
+                                                            extrinsics[:, :, 1], False,
+                                                            transformed_image_size=(256, 512))
+    cr_unrect, right_unrect = stereo_rectification.unrectify(cr_rect, right_rect, intrinsics[:, :, 1],
+                                                             intrinsics[:, :, 2], extrinsics[:, :, 1],
+                                                             extrinsics[:, :, 2], False,
+                                                             transformed_image_size=(256, 512))
+
+    sum_cl = np.sum(cl_unrect)
+    sum_cr = np.sum(cr_unrect)
+
+    if (sum_cl < sum_cr):
+        print('CL')
+        mask_unr = create_mask(cl_unrect, params)
+    else:
+        print('CR')
+        mask_unr = create_mask(cr_unrect, params)
+
+    plt.imshow(mask_unr.astype(float))
+    plt.show()
+
+    masks_tf = []
+    mask_unrect_tf = []
+    divisor = 1
+    for i in range(4):
+        print(i)
+
+        mask = np.zeros(
+            (np.divide(params.height, divisor).astype(int), np.divide(params.width, divisor).astype(int), 3, 4),
+            dtype=float)
+        mask[:, :, :, 0] = cv2.resize(create_mask(left_rect, params), (
+        np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)),
+                                      interpolation=cv2.INTER_AREA)
+        mask[:, :, :, 1] = cv2.resize(create_mask(cl_rect, params), (
+        np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)),
+                                      interpolation=cv2.INTER_AREA)
+        mask[:, :, :, 2] = cv2.resize(create_mask(cr_rect, params), (
+        np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)),
+                                      interpolation=cv2.INTER_AREA)
+        mask[:, :, :, 3] = cv2.resize(create_mask(right_rect, params), (
+        np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)),
+                                      interpolation=cv2.INTER_AREA)
+
+        mask_tf = tf.constant(mask[:, :, 0, :])
+        mask_tf = tf.expand_dims(mask_tf, 2)
+        mask_tf = tf.cast(mask_tf, dtype=tf.float32)
+
+        masks_tf.append(mask_tf)
+
+        mask_unrect = cv2.resize(mask_unr, (
+        np.divide(params.width, divisor).astype(int), np.divide(params.height, divisor).astype(int)))
+
+        mask_unrect_ = tf.constant(mask_unrect)
+        mask_unrect_ = tf.cast(mask_unrect_, dtype=tf.float32)
+
+        mask_unrect_tf.append(mask_unrect_)
+
+        divisor = divisor * 2
+
+    dataloader = TrinetDataloader(args.data_path, args.filenames_file, None, params, args.dataset, args.mode)
     left = dataloader.left_image_batch
-    central = dataloader.central_image_batch
+    cl = dataloader.cl_image_batch
+    cr = dataloader.cr_image_batch
     right = dataloader.right_image_batch
 
-    model = trinet(params, args.mode, left, central, right)
+    model = trinet(params, args.mode, left, cl, cr, right, dataloader.intrinsics, dataloader.extrinsics, mask_unrect_tf, masks_tf)
 
     # SESSION
     config = tf.ConfigProto(allow_soft_placement=True)
@@ -208,29 +482,39 @@ def test(params):
 
     num_test_samples = count_text_lines(args.filenames_file)
 
+    disparity_cl = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
+    disparity_cr = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
+    cl_unrect = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+    cr_unrect = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+    cl_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+    cr_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+
+    disparities_pp = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
+
     print('now testing {} files'.format(num_test_samples))
     disparities = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
     for step in range(13):
         print('Testing batch {}'.format(step))
-        fetches = [model.disp_cl, model.disp_cr, model.disp_c2l]
-        [disp_cl, disp_cr, disp_c2l] = sess.run(fetches)
-        print(disp_c2l[1].shape)
-        plt.imshow(disp_c2l[0][0,:,:,0])
-        plt.show()
-        plt.pause(2)
-        plt.imshow(disp_c2l[0][0, :, :, 1])
-        plt.show()
-        plt.pause(2)
-        disparities[step] = disp_cl[0].squeeze()
+        fetches = [model.disp_cl[0], model.disp_cr[0], model.cl_est_unrect[0], model.cr_est_unrect[0], model.cl, model.cr]
+        [disp_cl, disp_cr, cl_est_unrect, cr_est_unrect, cl, cr] = sess.run(fetches)
+        for i in range(params.batch_size):
+            disparity_cl[step*params.batch_size + i] = disp_cl[i].squeeze()
+            disparity_cr[step*params.batch_size + i] = disp_cr[i].squeeze()
+            cl_unrect[step*params.batch_size + i] = cl_est_unrect[i].squeeze()
+            cr_unrect[step*params.batch_size + i] = cr_est_unrect[i].squeeze()
+            cl_original[step*params.batch_size + i] = cl[i]
+            cr_original[step*params.batch_size + i] = cr[i]
+
 
     print('done.')
 
     print('writing disparities.')
-    if args.output_directory == '':
-        output_directory = os.path.dirname(args.checkpoint_path)
-    else:
-        output_directory = args.output_directory
-    np.save(output_directory + '/disparities.npy', disparities)
+    np.save(output_dir_left + '/disparity0.npy', disparity_cl)
+    np.save(output_dir_right + '/disparity1.npy', disparity_cr)
+    np.save(output_dir_left + '/cl_unrect.npy', cl_unrect)
+    np.save(output_dir_right + '/cr_unrect.npy', cr_unrect)
+    np.save(output_dir_left + '/cl_original.npy', cl_original)
+    np.save(output_dir_right + '/cr_original.npy', cr_original)
 
     print('done.')
 

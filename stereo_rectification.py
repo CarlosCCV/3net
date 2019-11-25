@@ -1,8 +1,9 @@
 import numpy as np
 import cv2
 import tensorflow as tf
+import os
 
-def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_image_size = (1080,1920), calibration_image_size = (1080,1920)):
+def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_image_size = (1080,1920), calibration_image_size = (1080,1920), directory = None):
 
     R1 = ext1[0:3,0:3]
 
@@ -10,16 +11,16 @@ def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_im
     multiplier = np.divide(transformed_image_size, calibration_image_size)
 
     A1_resized = np.copy(A1)
-    A1_resized[0, 0] = A1[0, 0] * multiplier[0]
-    A1_resized[1, 1] = A1[1, 1] * multiplier[1]
-    A1_resized[0, 2] = A1[0, 2] * multiplier[0]
-    A1_resized[1, 2] = A1[1, 2] * multiplier[1]
+    A1_resized[0, 0] = A1[0, 0] * multiplier[1]
+    A1_resized[1, 1] = A1[1, 1] * multiplier[0]
+    A1_resized[0, 2] = A1[0, 2] * multiplier[1]
+    A1_resized[1, 2] = A1[1, 2] * multiplier[0]
 
     A2_resized = np.copy(A2)
-    A2_resized[0, 0] = A2[0, 0] * multiplier[0]
-    A2_resized[1, 1] = A2[1, 1] * multiplier[1]
-    A2_resized[0, 2] = A2[0, 2] * multiplier[0]
-    A2_resized[1, 2] = A2[1, 2] * multiplier[1]
+    A2_resized[0, 0] = A2[0, 0] * multiplier[1]
+    A2_resized[1, 1] = A2[1, 1] * multiplier[0]
+    A2_resized[0, 2] = A2[0, 2] * multiplier[1]
+    A2_resized[1, 2] = A2[1, 2] * multiplier[0]
 
 
     Po1 = np.matmul(A1_resized, ext1)
@@ -50,6 +51,10 @@ def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_im
     Pn1 = np.matmul(A, np.concatenate((R, np.array([np.matmul(-R, c1)]).T), axis=1))
     Pn2 = np.matmul(A, np.concatenate((R, np.array([np.matmul(-R, c2)]).T), axis=1))
 
+    # New extrinsic parameters
+    ext1_rect = np.matmul(np.linalg.inv(A), Pn1)
+    ext2_rect = np.matmul(np.linalg.inv(A), Pn2)
+
     # Rectifying image transformation
     T1 = np.matmul(Pn1[0:3, 0:3], np.linalg.inv(Po1[0:3, 0:3]))
     T2 = np.matmul(Pn2[0:3, 0:3], np.linalg.inv(Po2[0:3, 0:3]))
@@ -75,11 +80,29 @@ def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_im
         img_rect2 = tf.contrib.image.transform(image2, T2_vector, interpolation='BILINEAR', output_shape = transformed_image_size)
 
     else:
-        print(image1.shape)
-        img_rect1 = cv2.warpPerspective(image1, T1, (image1.shape[1],image1.shape[0]))
-        img_rect2 = cv2.warpPerspective(image2, T2, (image1.shape[1],image1.shape[0]))
 
-    return img_rect1, img_rect2, T1_inv, T2_inv
+        img_rect1 = cv2.warpPerspective(image1, T1, (image1.shape[1],image1.shape[0]), borderMode=cv2.BORDER_CONSTANT, borderValue=(101, 101, 101))
+        img_rect2 = cv2.warpPerspective(image2, T2, (image1.shape[1],image1.shape[0]), borderMode=cv2.BORDER_CONSTANT, borderValue=(101, 101, 101))
+
+    # Save rectification parameters if a directory is given
+    if directory != None:
+
+        if not os.path.exists(directory):
+            os.mkdir(directory)
+
+        print('Saving rectified parameters to ' + directory)
+        np.save(os.path.join(directory, 'A.npy'), A)
+        np.save(os.path.join(directory, 'A1.npy'), A1_resized)
+        np.save(os.path.join(directory, 'A2.npy'), A2_resized)
+        np.save(os.path.join(directory, 'ext1.npy'), ext1)
+        np.save(os.path.join(directory, 'ext2.npy'), ext2)
+        np.save(os.path.join(directory, 'ext1_rect.npy'), ext1_rect)
+        np.save(os.path.join(directory, 'ext2_rect.npy'), ext2_rect)
+        np.save(os.path.join(directory, 'T1.npy'), T1)
+        np.save(os.path.join(directory, 'T2.npy'), T2)
+        print(A)
+
+    return img_rect1, img_rect2
 
 def unrectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_image_size = (1080,1920), calibration_image_size = (1080,1920)):
     R1 = ext1[0:3, 0:3]
@@ -88,16 +111,16 @@ def unrectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_image_s
     multiplier = np.divide(transformed_image_size, calibration_image_size)
 
     A1_resized = np.copy(A1)
-    A1_resized[0, 0] = A1[0, 0] * multiplier[0]
-    A1_resized[1, 1] = A1[1, 1] * multiplier[1]
-    A1_resized[0, 2] = A1[0, 2] * multiplier[0]
-    A1_resized[1, 2] = A1[1, 2] * multiplier[1]
+    A1_resized[0, 0] = A1[0, 0] * multiplier[1]
+    A1_resized[1, 1] = A1[1, 1] * multiplier[0]
+    A1_resized[0, 2] = A1[0, 2] * multiplier[1]
+    A1_resized[1, 2] = A1[1, 2] * multiplier[0]
 
     A2_resized = np.copy(A2)
-    A2_resized[0, 0] = A2[0, 0] * multiplier[0]
-    A2_resized[1, 1] = A2[1, 1] * multiplier[1]
-    A2_resized[0, 2] = A2[0, 2] * multiplier[0]
-    A2_resized[1, 2] = A2[1, 2] * multiplier[1]
+    A2_resized[0, 0] = A2[0, 0] * multiplier[1]
+    A2_resized[1, 1] = A2[1, 1] * multiplier[0]
+    A2_resized[0, 2] = A2[0, 2] * multiplier[1]
+    A2_resized[1, 2] = A2[1, 2] * multiplier[0]
 
     Po1 = np.matmul(A1_resized, ext1)
     Po2 = np.matmul(A2_resized, ext2)
@@ -152,8 +175,8 @@ def unrectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_image_s
         img_rect2 = tf.contrib.image.transform(image2, T2_vector, interpolation='BILINEAR', output_shape = transformed_image_size)
     else:
 
-        img_rect1 = cv2.warpPerspective(image1, T1_inv, (image1.shape[1], image1.shape[0]))
-        img_rect2 = cv2.warpPerspective(image2, T2_inv, (image1.shape[1], image1.shape[0]))
+        img_rect1 = cv2.warpPerspective(image1, T1_inv, (image1.shape[1], image1.shape[0]), borderMode=cv2.BORDER_CONSTANT, borderValue=(101, 101, 101))
+        img_rect2 = cv2.warpPerspective(image2, T2_inv, (image1.shape[1], image1.shape[0]), borderMode=cv2.BORDER_CONSTANT, borderValue=(101, 101, 101))
 
     return img_rect1, img_rect2
 

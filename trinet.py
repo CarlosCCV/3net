@@ -39,7 +39,7 @@ trinet_parameters = namedtuple('parameters',
 
 class trinet(object):
 
-    def __init__(self,params, mode, left, cl, cr, right, intrinsics, extrinsics, reuse_variables=None, model_index=0, net='vgg'):
+    def __init__(self,params, mode, left, cl, cr, right, intrinsics, extrinsics, mask_unrect=None, masks = None, reuse_variables=None, model_index=0, net='vgg'):
         self.params = params
         self.mode = mode
         self.model_collection = ['model_0']
@@ -47,6 +47,8 @@ class trinet(object):
         self.right = right
         self.cl = cl
         self.cr = cr
+        self.mask_unrect = mask_unrect
+        self.masks = masks
         self.reuse_variables = reuse_variables
         self.model_index = model_index
 
@@ -248,6 +250,14 @@ class trinet(object):
             self.disp_cr = [tf.expand_dims(d[:, :, :, 0], 3) for d in self.disp_c2r]
             self.disp_rc = [tf.expand_dims(d[:, :, :, 1], 3) for d in self.disp_c2r]
 
+            # # Apply masks
+            for i in range(4):
+                self.disp_lc[i] = tf.multiply(self.disp_lc[i], self.masks[i][:, :,:,0])
+                self.disp_cl[i] = tf.multiply(self.disp_cl[i], self.masks[i][:,:,:,1])
+                self.disp_cr[i] = tf.multiply(self.disp_cr[i], self.masks[i][:,:,:,2])
+                self.disp_rc[i] = tf.multiply(self.disp_rc[i], self.masks[i][:, :, :, 3])
+
+
         # GENERATE IMAGES
         with tf.variable_scope('images'):
             self.left_est = [self.generate_image_left(self.cl_pyramid[i], self.disp_lc[i]) for i in range(4)]
@@ -261,11 +271,13 @@ class trinet(object):
             print(type(self.left_est))
             self.cl_est_unrect = [None] * 4
             self.cr_est_unrect = [None] * 4
-
+            divisor = 1
             for i in range(4):
-                _,self.cl_est_unrect[i] = stereo_rectification.unrectify(self.left_est[i], self.cl_est[i], self.intrinsics[:,:,0], self.intrinsics[:,:,1], self.extrinsics[:,:,0],self.extrinsics[:,:,1], transformed_image_size=(self.params.height,self.params.width))
-                self.cr_est_unrect[i], _ = stereo_rectification.unrectify(self.cr_est[i], self.right_est[i], self.intrinsics[:, :, 1], self.intrinsics[:, :, 2], self.extrinsics[:, :, 1], self.extrinsics[:, :, 2], transformed_image_size=(self.params.height, self.params.width))
-
+                _,self.cl_est_unrect[i] = stereo_rectification.unrectify(self.left_est[i], self.cl_est[i], self.intrinsics[:,:,0], self.intrinsics[:,:,1], self.extrinsics[:,:,0],self.extrinsics[:,:,1], transformed_image_size=(np.divide(self.params.height, divisor).astype(int), np.divide(self.params.width, divisor).astype(int)))
+                self.cr_est_unrect[i], _ = stereo_rectification.unrectify(self.cr_est[i], self.right_est[i], self.intrinsics[:, :, 1], self.intrinsics[:, :, 2], self.extrinsics[:, :, 1], self.extrinsics[:, :, 2], transformed_image_size=(np.divide(self.params.height, divisor).astype(int), np.divide(self.params.width, divisor).astype(int)))
+                self.cl_est_unrect[i] = tf.multiply(self.cl_est_unrect[i], self.mask_unrect[i])
+                self.cr_est_unrect[i] = tf.multiply(self.cr_est_unrect[i], self.mask_unrect[i])
+                divisor = divisor * 2
 
         # LR CONSISTENCY
         with tf.variable_scope('left-right'):
@@ -355,7 +367,7 @@ class trinet(object):
             self.central_reconstruction_loss = tf.add_n(self.central_reconstruction_dif)
 
             # TOTAL LOSS
-            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss + self.params.lr_loss_weight * self.lr_loss + self.central_reconstruction_loss
+            self.total_loss = self.image_loss + self.params.disp_gradient_loss_weight * self.disp_gradient_loss  + self.central_reconstruction_loss + self.params.lr_loss_weight * self.lr_loss
 
             self.total_loss_L =  self.image_loss_L + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_L + self.params.lr_loss_weight * self.lr_loss_L
             self.total_loss_R = self.image_loss_R + self.params.disp_gradient_loss_weight * self.disp_gradient_loss_R + self.params.lr_loss_weight * self.lr_loss_R

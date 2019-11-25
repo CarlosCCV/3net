@@ -8,7 +8,7 @@ def string_length_tf(t):
 
 class TrinetDataloader(object):
     """trinet dataloader"""
-    def __init__(self, data_path, filenames_file, params, dataset, mode):
+    def __init__(self, data_path, filenames_file_train, filenames_file_validation, params, dataset, mode):
         self.data_path = data_path
         self.params = params
         self.dataset = dataset
@@ -18,17 +18,12 @@ class TrinetDataloader(object):
         self.central_image_batch = None
         self.right_image_batch = None
 
-        input_queue = tf.train.string_input_producer([filenames_file], shuffle=False)
+        input_queue = tf.train.string_input_producer([filenames_file_train], shuffle=False)
         line_reader = tf.TextLineReader()
         _, line = line_reader.read(input_queue)
 
         split_line = tf.string_split([line]).values
 
-        # we load only one image for test, except if we trained a stereo model
-        #if mode == 'test' and not self.params.do_stereo:
-            #left_image_path  = tf.string_join([self.data_path, split_line[0]])
-            #left_image_o  = self.read_image(left_image_path)
-        #else:
         left_image_path  = tf.string_join([self.data_path, split_line[0]])
         central_image_path = tf.string_join([self.data_path, split_line[1]])
         right_image_path = tf.string_join([self.data_path, split_line[2]])
@@ -36,8 +31,27 @@ class TrinetDataloader(object):
         central_image_o = self.read_image(central_image_path)
         right_image_o = self.read_image(right_image_path)
 
-        # Calibration parameters of the cameras
-        self.intrinsics,self.extrinsics = read_parameters.read_calibration_parameters(self.data_path, filenames_file)
+        if mode == 'train':
+
+            self.left_image_val_batch  = None
+            self.central_image_val_batch = None
+            self.right_image_val_batch = None
+
+            input_queue_val = tf.train.string_input_producer([filenames_file_validation], shuffle=False)
+            line_reader_val = tf.TextLineReader()
+            _, line_val = line_reader_val.read(input_queue_val)
+
+            split_line_val = tf.string_split([line_val]).values
+
+            left_image_val_path  = tf.string_join([self.data_path, split_line_val[0]])
+            central_image_val_path = tf.string_join([self.data_path, split_line_val[1]])
+            right_image_val_path = tf.string_join([self.data_path, split_line_val[2]])
+            left_image_val_o  = self.read_image(left_image_val_path)
+            central_image_val_o = self.read_image(central_image_val_path)
+            right_image_val_o = self.read_image(right_image_val_path)
+
+        # Calibration parameters of the cameras (DEBERIA CREAR UNA CLASE Y LEER ESTOS PARAMETROS DESDE LA FUNCION MAIN)
+        self.intrinsics,self.extrinsics = read_parameters.read_calibration_parameters(self.data_path, filenames_file_train)
 
         A_left = self.intrinsics[:,:,0]
         A_center = self.intrinsics[:, :, 1]
@@ -47,35 +61,66 @@ class TrinetDataloader(object):
         extrinsics_center = self.extrinsics[:, :, 1]
         extrinsics_right = self.extrinsics[:, :, 2]
 
-        if mode == 'train' or mode == 'test':
-            # randomly flip images
-            #do_flip = tf.random_uniform([], 0, 1)
-            #left_image  = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(right_image_o), lambda: left_image_o)
-            #central_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o),  lambda: right_image_o)
-            #right_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o), lambda: right_image_o)
 
-            left_image = left_image_o
-            central_image = central_image_o
-            right_image = right_image_o
+        # randomly flip images
+        #do_flip = tf.random_uniform([], 0, 1)
+        #left_image  = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(right_image_o), lambda: left_image_o)
+        #central_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o),  lambda: right_image_o)
+        #right_image = tf.cond(do_flip > 0.5, lambda: tf.image.flip_left_right(left_image_o), lambda: right_image_o)
 
-            # randomly augment images
-            if mode == 'train':
-                left_image, cl_image, _, _ = stereo_rectification.stereo_rectify(left_image, central_image, A_left, A_center, extrinsics_left, extrinsics_center, transformed_image_size=(self.params.height, self.params.width))
-                cr_image, right_image, _, _ = stereo_rectification.stereo_rectify(central_image, right_image, A_center, A_right, extrinsics_center, extrinsics_right,transformed_image_size=(self.params.height, self.params.width))
+        # capacity = min_after_dequeue + (num_threads + a small safety margin) * batch_size
+        min_after_dequeue = 2048
+        capacity = min_after_dequeue + 4 * params.batch_size
 
-                do_augment  = tf.random_uniform([], 0, 1)
-                left_image, cl_image, cr_image, right_image = tf.cond(do_augment > 0.5, lambda: self.augment_images(left_image, cl_image, cr_image, right_image), lambda: (left_image, cl_image, cr_image, right_image))
+        left_image = left_image_o
+        central_image = central_image_o
+        right_image = right_image_o
 
-            left_image.set_shape( [None, None, 3])
-            cr_image.set_shape([None, None, 3])
-            cl_image.set_shape([None, None, 3])
-            right_image.set_shape([None, None, 3])
 
-            # capacity = min_after_dequeue + (num_threads + a small safety margin) * batch_size
-            min_after_dequeue = 2048
-            capacity = min_after_dequeue + 4 * params.batch_size
-            self.left_image_batch, self.cl_image_batch, self.cr_image_batch, self.right_image_batch = tf.train.shuffle_batch([left_image, cl_image, cr_image, right_image],
-                        params.batch_size, capacity, min_after_dequeue, params.num_threads)
+        left_image, cl_image = stereo_rectification.stereo_rectify(left_image, central_image, A_left, A_center, extrinsics_left, extrinsics_center, transformed_image_size=(self.params.height, self.params.width))
+        cr_image, right_image = stereo_rectification.stereo_rectify(central_image, right_image, A_center, A_right, extrinsics_center, extrinsics_right, transformed_image_size=(self.params.height, self.params.width))
+
+
+        # randomly augment images
+        if mode == 'train':
+            left_image_val = left_image_val_o
+            central_image_val = central_image_val_o
+            right_image_val = right_image_val_o
+            left_image_val, cl_image_val = stereo_rectification.stereo_rectify(left_image_val, central_image_val, A_left,
+                                                                             A_center, extrinsics_left,
+                                                                             extrinsics_center,
+                                                                             transformed_image_size=(
+                                                                             self.params.height, self.params.width))
+            cr_image_val, right_image_val = stereo_rectification.stereo_rectify(central_image_val, right_image_val, A_center,
+                                                                              A_right, extrinsics_center,
+                                                                              extrinsics_right,
+                                                                              transformed_image_size=(
+                                                                              self.params.height,
+                                                                              self.params.width))
+            # do_augment  = tf.random_uniform([], 0, 1)
+            # left_image, cl_image, cr_image, right_image = tf.cond(do_augment > 0.5, lambda: self.augment_images(left_image, cl_image, cr_image, right_image), lambda: (left_image, cl_image, cr_image, right_image))
+
+            left_image_val.set_shape([None, None, 3])
+            cl_image_val.set_shape([None, None, 3])
+            cr_image_val.set_shape([None, None, 3])
+            right_image_val.set_shape([None, None, 3])
+
+            self.left_image_val_batch, self.cl_image_val_batch, self.cr_image_val_batch, self.right_image_val_batch = tf.train.shuffle_batch(
+                [left_image_val, cl_image_val, cr_image_val, right_image_val],
+                params.batch_size, capacity, min_after_dequeue, params.num_threads)
+
+        left_image.set_shape( [None, None, 3])
+        cl_image.set_shape([None, None, 3])
+        cr_image.set_shape([None, None, 3])
+        right_image.set_shape([None, None, 3])
+
+        print(left_image.shape)
+
+
+        self.left_image_batch, self.cl_image_batch, self.cr_image_batch, self.right_image_batch = tf.train.shuffle_batch([left_image, cl_image, cr_image, right_image],
+                    params.batch_size, capacity, min_after_dequeue, params.num_threads)
+
+
 
         #elif mode == 'test':
         #    self.left_image_batch = tf.stack([left_image_o,  tf.image.flip_left_right(left_image_o)],  0)
@@ -142,3 +187,6 @@ class TrinetDataloader(object):
         image  = tf.image.resize_images(image,  [self.params.height, self.params.width], tf.image.ResizeMethod.AREA)
 
         return image
+
+    def create_mask(self, image):
+        return image > 0
