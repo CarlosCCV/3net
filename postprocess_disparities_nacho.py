@@ -25,7 +25,7 @@ def readParameters(directory, stereoPair):
     # Intrinsic matrices
     A = np.zeros((3,3,2))
     if stereoPair % 2 == 0:
-        A[:,:,0] = np.load(os.path.join(directory,'A2.npy'))
+        A[: ,: ,0] = np.load(os.path.join(directory,'A2.npy'))
     else:
         A[:, :, 0] = np.load(os.path.join(directory, 'A1.npy'))
 
@@ -95,12 +95,29 @@ def changeCameraCoordinateSystem(point3D_source, ext_source, ext_dest):
 
     return point3D_dest
 
+def projectPoints(points3D, projectionMatrix):
+    points_projected = np.zeros((256, 512, 2))
+    for i in range(256):
+        for j in range(512):
+            point3D_hom = [points3D[i,j,0], points3D[i,j,1], points3D[i,j,2], 1]
+            points2d_array_hom = np.matmul(projectionMatrix, point3D_hom)
+            points_projected[i,j,:] = points2d_array_hom[:2] / points2d_array_hom[2]
 
-def changePerspective(image, T):
-    T_inv = np.linalg.inv(T)
-    image_dest = cv2.warpPerspective(image, T_inv, (512, 256), borderMode=cv2.BORDER_CONSTANT,
-                                         borderValue=(101, 101, 101))
-    return image_dest
+    return points_projected
+
+def buildDepthMap(points2D, depth, znear, zfar):
+    width = 512
+    height = 256
+    depth_map = np.zeros((256, 512))
+    for i in range(256):
+        for j in range(512):
+            x = np.round(points2D[i, j, 0]).astype(np.int)
+            y = np.round(points2D[i, j, 1]).astype(np.int)
+            if (x > 0 and x < width and y>0 and y < height):
+                depth_map[y,x] = depth[i,j]
+
+    depth_map = applyZRange(depth_map, znear, zfar)
+    return depth_map
 
 
 def depthToMeters(depth_map):
@@ -168,7 +185,7 @@ def main(directory, stereo_pairs, znear, zfar, fuse_criteria):
         # Read Disparities
         disparities = np.load(os.path.join(directory, 'stereoPair' + str(k), 'disparity' + str(k) + '.npy'))
         num_images = disparities.shape[0]
-        num_images = 3
+        num_images = 2
         height = disparities.shape[1]
         width = disparities.shape[2]
 
@@ -179,6 +196,15 @@ def main(directory, stereo_pairs, znear, zfar, fuse_criteria):
         points3d_dest = np.zeros((num_images, height, width, 3))
         depth_map_source = np.zeros((num_images, height, width))
         depth_map_dest = np.zeros((num_images, height, width))
+        ones_array = np.ones((1, height * width))
+
+        # rotation = ext[:,:3,0,k]
+        # translation = np.matmul(-ext[:,:3,0,k], ext[:,3,0,k])
+        # translation = np.reshape(translation, (3,1))
+        rotation = np.identity(3)
+        translation = np.zeros((3,1))
+        extrinsics = np.concatenate((rotation, translation), axis = 1)
+        projectionMatrix = np.matmul(A[:,:,0,k], extrinsics)
         for i in range(num_images):
 
             # Obtain 3D points in Camera Coordinates
@@ -187,14 +213,11 @@ def main(directory, stereo_pairs, znear, zfar, fuse_criteria):
             # Change the coordinates system to the desired Camera Coordinates System (central camera)
             points3d_dest[i, :, :, :] = changeCameraCoordinateSystem(points3d_source[i, :, :, :], ext[: ,:, 1, k], ext[:, :, 0, k])
 
-            # Obtain depth map and apply zrange
-            depth_map_source[i, :, :] = applyZRange(points3d_dest[i, :, :, 2], znear, zfar)
+            # Project points
+            points_projected = projectPoints(points3d_dest[i, :, :, :], projectionMatrix)
 
-            # Change perspective of the depth map tobe aligned with the desired camera
-            depth_map_dest[i, :, :] = changePerspective(points3d_dest[i, :, :, 2], T[:, :, k])
-
-            # Obtain depth map and apply zrange
-            depth_map_dest[i, :, :] = applyZRange(depth_map_dest[i, :, :], znear, zfar)
+            # Build depth map
+            depth_map_dest[i,:,:] = buildDepthMap(points_projected, points3d_dest[i, :, :, 2], znear, zfar)
 
         depth_map_list.append(depth_map_dest)
 
@@ -206,6 +229,13 @@ def main(directory, stereo_pairs, znear, zfar, fuse_criteria):
     # Fuse depth maps to obtain an improved one
     fusedDepthMaps = fuseDepthMaps(depth_maps, fuse_criteria)
 
+    plt.figure(0)
+    plt.imshow(depth_maps[1,:,:,0], cmap = 'gray')
+    plt.figure(1)
+    plt.imshow(depth_maps[1, :, :, 1], cmap='gray')
+    plt.figure(2)
+    plt.imshow(fusedDepthMaps[1, :, :])
+    plt.show()
 
     #### THAT WOULD BE THE RESULT, NOW I NEED TO TRANSFORM IT TO OBTAIN TO DISPARITIES IN THE RECTIFIED CAMERAS, IN ORDER
     #### TO EVALUATE THE QUALITY OF THE DEPTH MAP OBTAINED
@@ -217,56 +247,56 @@ def main(directory, stereo_pairs, znear, zfar, fuse_criteria):
 
     print(fusedDisparities.shape)
 
-    # Get disparity
-    # Construct Q matrix from intrinsic and extrinsic parameters of the central camera
-    Q = constructQmatrix(A[:, :, 0, 0], baseline[0, 0])
+    # # Get disparity
+    # # Construct Q matrix from intrinsic and extrinsic parameters of the central camera
+    # Q = constructQmatrix(A[:, :, 0, 0], baseline[0, 0])
+    #
+    # # Change from depth to disparity
+    # fusedDisparities[:, :, :] = depthToDisparity(fusedDepthMaps, A[0, 0, 0, 0], baseline[0, 0])
+    #
+    # # Obtain 3D points
+    # for i in range(num_images):
+    #     fused3DPoints[i, :, :, :] = cv2.reprojectImageTo3D(np.float32(fusedDisparities[i, :, :] * width),
+    #                                                       np.float32(Q))
+    #
+    # fusedDepthPerPair = np.zeros((num_images, height, width, stereo_pairs))
+    # fusedDisparitiesPerPair = np.zeros((num_images, height, width, stereo_pairs))
+    # for k in range(stereo_pairs):
+    #     for i in range(num_images):
+    #
+    #         # Change the coordinates system to the desired Camera Coordinates System (central camera)
+    #         fused3DperPair[i, :, :, :, k] = changeCameraCoordinateSystem(fused3DPoints[i, :, :, :], ext[:, :, 0, k],
+    #                                                                  ext[:, :, 1, k])
 
-    # Change from depth to disparity
-    fusedDisparities[:, :, :] = depthToDisparity(fusedDepthMaps, A[0, 0, 0, 0], baseline[0, 0])
-
-    # Obtain 3D points
-    for i in range(num_images):
-        fused3DPoints[i, :, :, :] = cv2.reprojectImageTo3D(np.float32(fusedDisparities[i, :, :] * width),
-                                                          np.float32(Q))
-
-    fusedDepthPerPair = np.zeros((num_images, height, width, stereo_pairs))
-    fusedDisparitiesPerPair = np.zeros((num_images, height, width, stereo_pairs))
-    for k in range(stereo_pairs):
-        for i in range(num_images):
-
-            # Change the coordinates system to the desired Camera Coordinates System (central camera)
-            fused3DperPair[i, :, :, :, k] = changeCameraCoordinateSystem(fused3DPoints[i, :, :, :], ext[:, :, 0, k],
-                                                                     ext[:, :, 1, k])
-
-            # Change perspective of the depth map tobe aligned with the desired camera
-            fusedDepthPerPair[i, :, :, k] = changePerspective(fused3DperPair[i, :, :, 2, k], np.linalg.inv(T[:, :, k]))
-
-            # Obtain depth map and apply zrange
-            fusedDepthPerPair[i, :, :, k] = applyZRange(fusedDepthPerPair[i, :, :, k], znear, zfar)
-
-        # Change from depth to disparities
-        fusedDisparitiesPerPair[:, :, :, k] = depthToDisparity(fusedDepthPerPair[:, :, :, k], A[0, 0, 1, k], baseline[k, 1])
-
-
+    #         # Change perspective of the depth map tobe aligned with the desired camera
+    #         fusedDepthPerPair[i, :, :, k] = changePerspective(fused3DperPair[i, :, :, 2, k], np.linalg.inv(T[:, :, k]))
+    #
+    #         # Obtain depth map and apply zrange
+    #         fusedDepthPerPair[i, :, :, k] = applyZRange(fusedDepthPerPair[i, :, :, k], znear, zfar)
+    #
+    #     # Change from depth to disparities
+    #     fusedDisparitiesPerPair[:, :, :, k] = depthToDisparity(fusedDepthPerPair[:, :, :, k], A[0, 0, 1, k], baseline[k, 1])
 
 
 
 
-    idx = np.isnan(fusedDisparities[:,:,:])
-    fusedDisparities[idx] = 0
-    print(np.amax(fusedDisparities))
-    plt.figure(0)
-    for i in range(256):
-        for j in range(512):
-            if (fusedDisparitiesPerPair[1,i,j,0] < znear or fusedDisparitiesPerPair[1,i, j,0] > 1):
-                fusedDisparitiesPerPair[1,i, j,0] = 0
-    plt.imshow(fusedDisparitiesPerPair[1,:,:,0], cmap='gray')
-    plt.figure(1)
-    plt.imshow(fusedDisparitiesPerPair[1,:,:,1], cmap = 'gray')
-    plt.figure(2)
 
-    plt.imshow(fusedDisparities[1, :, :], cmap = 'gray')
-    plt.show()
+
+    # idx = np.isnan(fusedDisparities[:,:,:])
+    # fusedDisparities[idx] = 0
+    # print(np.amax(fusedDisparities))
+    # plt.figure(0)
+    # for i in range(256):
+    #     for j in range(512):
+    #         if (fusedDisparitiesPerPair[1,i,j,0] < znear or fusedDisparitiesPerPair[1,i, j,0] > 1):
+    #             fusedDisparitiesPerPair[1,i, j,0] = 0
+    # plt.imshow(fusedDisparitiesPerPair[1,:,:,0], cmap='gray')
+    # plt.figure(1)
+    # plt.imshow(fusedDisparitiesPerPair[1,:,:,1], cmap = 'gray')
+    # plt.figure(2)
+    #
+    # plt.imshow(fusedDisparities[1, :, :], cmap = 'gray')
+    # plt.show()
 
 if __name__=="__main__":
 

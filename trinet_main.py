@@ -488,6 +488,8 @@ def test(params):
     cr_unrect = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
     cl_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
     cr_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+    left_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
+    right_original = np.zeros((num_test_samples, params.height, params.width, 3), dtype=np.float32)
 
     disparities_pp = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
 
@@ -495,8 +497,8 @@ def test(params):
     disparities = np.zeros((num_test_samples, params.height, params.width), dtype=np.float32)
     for step in range(13):
         print('Testing batch {}'.format(step))
-        fetches = [model.disp_cl[0], model.disp_cr[0], model.cl_est_unrect[0], model.cr_est_unrect[0], model.cl, model.cr]
-        [disp_cl, disp_cr, cl_est_unrect, cr_est_unrect, cl, cr] = sess.run(fetches)
+        fetches = [model.disp_cl[0], model.disp_cr[0], model.cl_est_unrect[0], model.cr_est_unrect[0], model.cl, model.cr, model.left, model.right]
+        [disp_cl, disp_cr, cl_est_unrect, cr_est_unrect, cl, cr, left, right] = sess.run(fetches)
         for i in range(params.batch_size):
             disparity_cl[step*params.batch_size + i] = disp_cl[i].squeeze()
             disparity_cr[step*params.batch_size + i] = disp_cr[i].squeeze()
@@ -504,6 +506,8 @@ def test(params):
             cr_unrect[step*params.batch_size + i] = cr_est_unrect[i].squeeze()
             cl_original[step*params.batch_size + i] = cl[i]
             cr_original[step*params.batch_size + i] = cr[i]
+            left_original[step * params.batch_size + i] = left[i]
+            right_original[step * params.batch_size + i] = right[i]
 
 
     print('done.')
@@ -511,10 +515,10 @@ def test(params):
     print('writing disparities.')
     np.save(output_dir_left + '/disparity0.npy', disparity_cl)
     np.save(output_dir_right + '/disparity1.npy', disparity_cr)
-    np.save(output_dir_left + '/cl_unrect.npy', cl_unrect)
-    np.save(output_dir_right + '/cr_unrect.npy', cr_unrect)
-    np.save(output_dir_left + '/cl_original.npy', cl_original)
-    np.save(output_dir_right + '/cr_original.npy', cr_original)
+    np.save(output_dir_left + '/central_unrect.npy', cl_unrect)
+    np.save(output_dir_right + '/central_unrect.npy', cr_unrect)
+    np.save(output_dir_left + '/central_original.npy', cl_original)
+    np.save(output_dir_right + '/central_original.npy', cr_original)
 
     print('done.')
 

@@ -22,7 +22,10 @@ def stereo_rectify(image1, image2, A1, A2, ext1, ext2, TF = True, transformed_im
     A2_resized[0, 2] = A2[0, 2] * multiplier[1]
     A2_resized[1, 2] = A2[1, 2] * multiplier[0]
 
-
+    mult1 = -np.matmul(ext1[:,:3], ext1[:,3])
+    mult2 = -np.matmul(ext2[:, :3], ext2[:, 3])
+    ext1_1 = np.concatenate((ext1[:,:3], np.reshape(mult1, (3,1))), axis = 1)
+    ext2_1 = np.concatenate((ext2[:,:3], np.reshape(mult2, (3,1))), axis = 1)
     Po1 = np.matmul(A1_resized, ext1)
     Po2 = np.matmul(A2_resized, ext2)
 
